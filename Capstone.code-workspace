@@ -1,0 +1,69 @@
+{
+  "folders": [
+    {
+      "path": ".",
+      "name": "Watermark Robustness Testing - D:\\whole capstone"
+    }
+  ],
+  "settings": {
+    "python.defaultInterpreterPath": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+    "python.linting.enabled": true,
+    "python.linting.pylintEnabled": true,
+    "python.formatting.provider": "black",
+    "editor.formatOnSave": true,
+    "[python]": {
+      "editor.defaultFormatter": "ms-python.python",
+      "editor.formatOnSave": true
+    },
+    "files.exclude": {
+      "**/__pycache__": true,
+      "**/*.pyc": true,
+      ".venv": false
+    },
+    "search.exclude": {
+      "**/__pycache__": true,
+      ".venv": true
+    }
+  },
+  "launch": {
+    "version": "0.2.0",
+    "configurations": [
+      {
+        "name": "Python: Flask App",
+        "type": "python",
+        "request": "launch",
+        "module": "flask",
+        "env": {
+          "FLASK_APP": "app.py",
+          "FLASK_ENV": "development"
+        },
+        "args": ["run"],
+        "jinja": true,
+        "justMyCode": true
+      }
+    ]
+  },
+  "tasks": {
+    "version": "2.0.0",
+    "tasks": [
+      {
+        "label": "Activate Virtual Environment",
+        "type": "shell",
+        "command": ".venv\\Scripts\\activate",
+        "problemMatcher": []
+      },
+      {
+        "label": "Install Dependencies",
+        "type": "shell",
+        "command": ".venv\\Scripts\\pip install -r requirements.txt",
+        "problemMatcher": []
+      },
+      {
+        "label": "Run Flask App",
+        "type": "shell",
+        "command": "python app.py",
+        "problemMatcher": []
+      }
+    ]
+  }
+}

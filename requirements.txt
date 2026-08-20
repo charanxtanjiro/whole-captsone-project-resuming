@@ -1,0 +1,8 @@
+Flask==3.0.3
+Werkzeug==3.0.2
+Pillow==12.3.0
+opencv-python==5.0.0.93
+numpy==2.5.2
+invisible-watermark==0.2.0
+PyWavelets==1.9.0
+openpyxl==3.1.5

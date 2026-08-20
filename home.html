@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Watermark Robustness Testing System - Home</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .main-container {
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+            max-width: 900px;
+            width: 100%;
+        }
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 40px 30px;
+            text-align: center;
+        }
+        .header h1 { font-size: 28px; margin-bottom: 8px; }
+        .header p { font-size: 15px; opacity: 0.9; }
+        .content { padding: 40px 30px; }
+        .status-info {
+            background: #f0fdf4;
+            border: 2px solid #10b981;
+            color: #166534;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+            text-align: center;
+        }
+        .status-info.error { background: #fee2e2; border-color: #ef4444; color: #991b1b; }
+        .buttons-section { display: flex; gap: 15px; justify-content: center; margin: 30px 0; flex-wrap: wrap; }
+        .btn {
+            padding: 14px 32px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+            transition: all 0.3s;
+        }
+        .btn-primary { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; }
+        .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 10px 20px rgba(102,126,234,0.3); }
+        .instructions {
+            background: #eff6ff;
+            border-left: 4px solid #3b82f6;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+        .instructions h4 { color: #1e40af; margin-bottom: 12px; }
+        .instructions ol { margin-left: 20px; color: #1e40af; line-height: 1.8; }
+        .footer { background: #f9fafb; padding: 15px; text-align: center; color: #666; font-size: 13px; }
+    </style>
+</head>
+<body>
+    <div class="main-container">
+        <div class="header">
+            <h1>🔒 Watermark Robustness Testing System</h1>
+            <p>Test invisible watermark survival against various attacks</p>
+        </div>
+        <div class="content">
+            <div id="serverStatus" class="status-info">
+                <strong>🔄 Checking Server Status...</strong>
+                <p>Please wait while we verify the application is running.</p>
+            </div>
+
+            <div class="instructions">
+                <h4>🚀 How to Start the App:</h4>
+                <ol>
+                    <li>Open PowerShell</li>
+                    <li>Navigate: <code>cd D:\whole capstone</code></li>
+                    <li>Activate: <code>.venv\Scripts\activate</code></li>
+                    <li>Run: <code>python app.py</code></li>
+                    <li>Wait for: "Running on http://127.0.0.1:5000"</li>
+                    <li>Click "Open Application" below</li>
+                </ol>
+            </div>
+
+            <div class="buttons-section">
+                <button class="btn btn-primary" onclick="window.open('http://localhost:5000', '_blank')">
+                    🌐 Open Application (http://localhost:5000)
+                </button>
+            </div>
+        </div>
+        <div class="footer">Watermark Robustness Testing System</div>
+    </div>
+
+    <script>
+        window.addEventListener('load', checkServerStatus);
+        function checkServerStatus() {
+            fetch('http://localhost:5000/health')
+                .then(r => r.json())
+                .then(d => updateServerStatus(d.status === 'ok'))
+                .catch(() => updateServerStatus(false));
+        }
+        function updateServerStatus(isRunning) {
+            const el = document.getElementById('serverStatus');
+            if (isRunning) {
+                el.className = 'status-info';
+                el.innerHTML = '<strong>✅ Server is Running!</strong><p>Click the button below to open it.</p>';
+            } else {
+                el.className = 'status-info error';
+                el.innerHTML = '<strong>⚠️ Server Not Running</strong><p>Follow the instructions below to start the application.</p>';
+            }
+        }
+        setInterval(checkServerStatus, 5000);
+    </script>
+</body>
+</html>
