@@ -12,6 +12,7 @@ from werkzeug.utils import secure_filename
 from pixel_watermark import PixelWatermark, get_pixel_statistics
 from image_pixel_converter import image_to_pixel_array
 from pixel_excel_converter import PixelExcelConverter
+from pixel_manipulator import PixelManipulator
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "capstone-secret-key-change-in-prod")
@@ -31,9 +32,11 @@ DEFAULT_PASSWORD = os.environ.get("DEFAULT_PASSWORD", "password")
 os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
 os.makedirs(os.path.dirname(app.config["DATABASE"]), exist_ok=True)
 
-# Initialize pixel watermarking
+# Initialize pixel watermarking and manipulator
 pixel_wm = PixelWatermark(strength=5)
 pixel_converter = PixelExcelConverter()
+pixel_manipulator = PixelManipulator()
+
 
 
 def allowed_file(filename):
@@ -472,6 +475,122 @@ def pixel_info(filename):
     except Exception as e:
         app.logger.error(f"Pixel info error: {e}")
         return render_template("error.html", message=f"Error: {e}"), 500
+
+
+@app.route("/pixel-manipulation/<filename>")
+def pixel_manipulation_view(filename):
+    """Render the Pixel Manipulation & RGB Statistics interface"""
+    if "logged_in" not in session:
+        return redirect(url_for("login"))
+    
+    try:
+        file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+        if not os.path.exists(file_path):
+            return render_template("error.html", message="Image not found"), 404
+        
+        return render_template("pixel_manipulation.html", filename=filename)
+        
+    except Exception as e:
+        app.logger.error(f"Pixel manipulation view error: {e}")
+        return render_template("error.html", message=f"Error: {e}"), 500
+
+
+@app.route("/api/pixel-manipulate/<filename>", methods=["POST"])
+def api_pixel_manipulate(filename):
+    """API endpoint to execute pixel manipulation and calculate RGB statistics"""
+    if "logged_in" not in session:
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    
+    try:
+        file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+        if not os.path.exists(file_path):
+            return jsonify({"success": False, "error": "Source image not found"}), 404
+        
+        req_data = request.get_json() or {}
+        percentage = float(req_data.get("percentage", 10))
+        method = req_data.get("method", "noise")
+        intensity = int(req_data.get("intensity", 50))
+        
+        # Prepare output manipulated file path
+        base_name, ext = os.path.splitext(filename)
+        manipulated_filename = f"{base_name}_manip_{int(percentage)}pct_{method}.png"
+        manipulated_path = os.path.join(app.config["UPLOAD_FOLDER"], manipulated_filename)
+        
+        # Execute manipulation
+        result = pixel_manipulator.manipulate_image(
+            image_path=file_path,
+            output_path=manipulated_path,
+            percentage=percentage,
+            method=method,
+            intensity=intensity
+        )
+        
+        if not result.get("success"):
+            return jsonify({"success": False, "error": result.get("error")}), 500
+        
+        return jsonify(result), 200
+        
+    except Exception as e:
+        app.logger.error(f"API pixel manipulation error: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/export-manipulation-excel/<filename>")
+def export_manipulation_excel(filename):
+    """Export pixel manipulation RGB statistical report as an Excel file"""
+    if "logged_in" not in session:
+        return redirect(url_for("login"))
+    
+    try:
+        file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+        if not os.path.exists(file_path):
+            return jsonify({"success": False, "error": "Image not found"}), 404
+        
+        # Get query parameters if any (default 10% noise)
+        percentage = float(request.args.get("percentage", 10))
+        method = request.args.get("method", "noise")
+        intensity = int(request.args.get("intensity", 50))
+        
+        base_name, ext = os.path.splitext(filename)
+        manipulated_filename = f"{base_name}_manip_{int(percentage)}pct_{method}.png"
+        manipulated_path = os.path.join(app.config["UPLOAD_FOLDER"], manipulated_filename)
+        
+        # If manipulated file doesn't exist yet, generate it
+        if not os.path.exists(manipulated_path):
+            stats_payload = pixel_manipulator.manipulate_image(
+                image_path=file_path,
+                output_path=manipulated_path,
+                percentage=percentage,
+                method=method,
+                intensity=intensity
+            )
+        else:
+            stats_payload = pixel_manipulator.manipulate_image(
+                image_path=file_path,
+                output_path=manipulated_path,
+                percentage=percentage,
+                method=method,
+                intensity=intensity
+            )
+        
+        excel_filename = f"{base_name}_pixel_manipulation_stats.xlsx"
+        excel_path = os.path.join(app.config["UPLOAD_FOLDER"], excel_filename)
+        
+        export_res = pixel_manipulator.export_manipulation_excel(
+            image_path=file_path,
+            manipulated_path=manipulated_path,
+            excel_path=excel_path,
+            stats_payload=stats_payload
+        )
+        
+        if export_res.get("success"):
+            return send_from_directory(app.config["UPLOAD_FOLDER"], excel_filename, as_attachment=True)
+        else:
+            return jsonify({"success": False, "error": export_res.get("error")}), 500
+            
+    except Exception as e:
+        app.logger.error(f"Manipulation Excel export error: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route("/detect-watermark/<filename>")
