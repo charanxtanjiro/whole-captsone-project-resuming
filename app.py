@@ -13,6 +13,7 @@ from pixel_watermark import PixelWatermark, get_pixel_statistics
 from image_pixel_converter import image_to_pixel_array
 from pixel_excel_converter import PixelExcelConverter
 from pixel_manipulator import PixelManipulator
+from sipi_database_manager import SipiDatabaseManager, SIPI_MAIN_URL, SIPI_VOLUMES, SIPI_PRESETS
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "capstone-secret-key-change-in-prod")
@@ -32,10 +33,11 @@ DEFAULT_PASSWORD = os.environ.get("DEFAULT_PASSWORD", "password")
 os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
 os.makedirs(os.path.dirname(app.config["DATABASE"]), exist_ok=True)
 
-# Initialize pixel watermarking and manipulator
+# Initialize pixel watermarking, manipulator, and SIPI database manager
 pixel_wm = PixelWatermark(strength=5)
 pixel_converter = PixelExcelConverter()
 pixel_manipulator = PixelManipulator()
+sipi_manager = SipiDatabaseManager()
 
 
 
@@ -333,9 +335,76 @@ def uploaded_file(filename):
         return "File not found", 404
 
 
+@app.route("/api/sipi/catalog")
+def api_sipi_catalog():
+    """Get full catalog of USC-SIPI Image Database volumes and curated presets"""
+    try:
+        return jsonify({
+            "success": True,
+            "catalog": sipi_manager.get_catalog()
+        }), 200
+    except Exception as e:
+        app.logger.error(f"SIPI catalog error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/sipi/import", methods=["POST"])
+def api_sipi_import():
+    """Import a USC-SIPI benchmark preset or custom URL, embed LSB watermark, and register in database"""
+    if "logged_in" not in session:
+        return jsonify({"success": False, "error": "Not logged in"}), 401
+
+    try:
+        req_data = request.get_json() or {}
+        preset_id = req_data.get("preset_id")
+        custom_url = req_data.get("url")
+        custom_name = req_data.get("name")
+
+        clean_name = secure_filename(custom_name or f"sipi_{preset_id or 'benchmark'}.png")
+        if not clean_name.endswith('.png'):
+            clean_name += '.png'
+        stored_name = f"{uuid4().hex}_{clean_name}"
+        file_path = os.path.join(app.config["UPLOAD_FOLDER"], stored_name)
+
+        if custom_url:
+            app.logger.info(f"Importing image from URL: {custom_url}")
+            dl_res = sipi_manager.import_from_url(custom_url, file_path)
+            if not dl_res.get("success"):
+                return jsonify({"success": False, "error": dl_res.get("error")}), 400
+        elif preset_id:
+            app.logger.info(f"Generating SIPI preset asset: {preset_id}")
+            sipi_manager.generate_benchmark_asset(preset_id, file_path)
+        else:
+            return jsonify({"success": False, "error": "Either preset_id or url must be provided"}), 400
+
+        # Embed LSB watermark
+        try:
+            pixel_wm.embed_in_lsb(file_path, "Capstone")
+            app.logger.info(f"Watermark embedded into imported SIPI image {stored_name}")
+        except Exception as e:
+            app.logger.warning(f"Watermark embedding warning: {e}")
+
+        # Save to database
+        conn = get_db_connection()
+        conn.execute("INSERT INTO uploads (filename, original_name, pixels_converted) VALUES (?, ?, ?)",
+                     (stored_name, f"SIPI_{preset_id or 'Custom'}_{clean_name}", 0))
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            "success": True,
+            "message": f"Successfully imported SIPI benchmark '{clean_name}' with embedded watermark!",
+            "filename": stored_name
+        }), 200
+
+    except Exception as e:
+        app.logger.error(f"SIPI import error: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/convert-pixels/<filename>", methods=["POST"])
 def convert_pixels(filename):
-    """Convert image to pixels"""
+    """Convert image to pixels with fast limit option"""
     if "logged_in" not in session:
         return jsonify({"success": False, "error": "Not logged in"}), 401
     
@@ -344,10 +413,14 @@ def convert_pixels(filename):
         if not os.path.exists(file_path):
             return jsonify({"success": False, "error": "Image not found"}), 404
         
-        app.logger.info(f"Converting {filename} to pixels...")
+        req_data = request.get_json() if request.is_json else {}
+        limit_setting = request.args.get("limit") or (req_data.get("limit") if req_data else None) or "standard_50"
+        max_w, max_h = pixel_converter.parse_sample_limit(limit_setting)
         
-        # Get pixel grid as JSON
-        grid_data = pixel_converter.get_pixel_grid_json(file_path, max_width=50, max_height=50)
+        app.logger.info(f"Converting {filename} to pixels with limit {max_w}x{max_h}...")
+        
+        # Get pixel grid as JSON with fast limit
+        grid_data = pixel_converter.get_pixel_grid_json(file_path, max_width=max_w, max_height=max_h)
         
         if not grid_data["success"]:
             return jsonify({"success": False, "error": grid_data["error"]}), 500
@@ -382,12 +455,14 @@ def pixel_grid_view(filename):
         if not os.path.exists(file_path):
             return render_template("error.html", message="Image not found"), 404
         
-        grid_data = pixel_converter.get_pixel_grid_json(file_path, max_width=50, max_height=50)
+        limit_setting = request.args.get("limit", "standard_50")
+        max_w, max_h = pixel_converter.parse_sample_limit(limit_setting)
+        grid_data = pixel_converter.get_pixel_grid_json(file_path, max_width=max_w, max_height=max_h)
         
         if not grid_data["success"]:
             return render_template("error.html", message=grid_data["error"]), 500
         
-        return render_template("pixel_grid.html", filename=filename, grid=grid_data)
+        return render_template("pixel_grid.html", filename=filename, grid=grid_data, active_limit=limit_setting)
         
     except Exception as e:
         app.logger.error(f"Pixel grid error: {e}")
@@ -396,7 +471,7 @@ def pixel_grid_view(filename):
 
 @app.route("/export-excel/<filename>")
 def export_excel(filename):
-    """Export to Excel"""
+    """Export to Excel with fast limits and style caching"""
     if "logged_in" not in session:
         return redirect(url_for("login"))
     
@@ -405,13 +480,15 @@ def export_excel(filename):
         if not os.path.exists(file_path):
             return jsonify({"success": False, "error": "Image not found"}), 404
         
-        excel_filename = f"{filename.split('.')[0]}_pixels.xlsx"
+        limit_setting = request.args.get("limit", "standard_50")
+        include_viz = request.args.get("viz", "true").lower() == "true"
+        excel_filename = f"{filename.split('.')[0]}_pixels_{limit_setting}.xlsx"
         excel_path = os.path.join(app.config["UPLOAD_FOLDER"], excel_filename)
         
-        result = pixel_converter.image_to_excel(file_path, excel_path, sample_size=(50, 50))
+        result = pixel_converter.image_to_excel(file_path, excel_path, sample_size=limit_setting, include_viz=include_viz)
         
         if result["success"]:
-            app.logger.info(f"Excel exported: {excel_path}")
+            app.logger.info(f"Excel exported rapidly: {excel_path}")
             return send_from_directory(app.config["UPLOAD_FOLDER"], excel_filename, as_attachment=True)
         else:
             return jsonify({"success": False, "error": result["error"]}), 500
@@ -497,7 +574,7 @@ def pixel_manipulation_view(filename):
 
 @app.route("/api/pixel-manipulate/<filename>", methods=["POST"])
 def api_pixel_manipulate(filename):
-    """API endpoint to execute pixel manipulation and calculate RGB statistics"""
+    """API endpoint to execute pixel manipulation (single percentage or ROI) and calculate RGB statistics"""
     if "logged_in" not in session:
         return jsonify({"success": False, "error": "Unauthorized"}), 401
     
@@ -510,10 +587,15 @@ def api_pixel_manipulate(filename):
         percentage = float(req_data.get("percentage", 10))
         method = req_data.get("method", "noise")
         intensity = int(req_data.get("intensity", 50))
+        roi = req_data.get("roi", None)
         
         # Prepare output manipulated file path
         base_name, ext = os.path.splitext(filename)
-        manipulated_filename = f"{base_name}_manip_{int(percentage)}pct_{method}.png"
+        pct_str = int(percentage) if percentage == int(percentage) else percentage
+        roi_suffix = ""
+        if roi:
+            roi_suffix = f"_roi_{roi.get('x1', roi.get('x', 0))}_{roi.get('y1', roi.get('y', 0))}"
+        manipulated_filename = f"{base_name}_manip_{pct_str}pct_{method}{roi_suffix}.png"
         manipulated_path = os.path.join(app.config["UPLOAD_FOLDER"], manipulated_filename)
         
         # Execute manipulation
@@ -522,7 +604,8 @@ def api_pixel_manipulate(filename):
             output_path=manipulated_path,
             percentage=percentage,
             method=method,
-            intensity=intensity
+            intensity=intensity,
+            roi=roi
         )
         
         if not result.get("success"):
@@ -535,9 +618,273 @@ def api_pixel_manipulate(filename):
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/api/pixel-manipulate-multi/<filename>", methods=["POST"])
+def api_pixel_manipulate_multi(filename):
+    """API endpoint to execute manipulation simultaneously across all standard percentages (5%, 10%, 25%, 75%, 100%)"""
+    if "logged_in" not in session:
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    
+    try:
+        file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+        if not os.path.exists(file_path):
+            return jsonify({"success": False, "error": "Source image not found"}), 404
+        
+        req_data = request.get_json() or {}
+        percentages = req_data.get("percentages", [5.0, 10.0, 25.0, 75.0, 100.0])
+        method = req_data.get("method", "noise")
+        intensity = int(req_data.get("intensity", 50))
+        roi = req_data.get("roi", None)
+        
+        result = pixel_manipulator.manipulate_multi_percentages(
+            image_path=file_path,
+            output_dir=app.config["UPLOAD_FOLDER"],
+            percentages=percentages,
+            method=method,
+            intensity=intensity,
+            roi=roi
+        )
+        
+        if not result.get("success"):
+            return jsonify({"success": False, "error": result.get("error")}), 500
+        
+        return jsonify(result), 200
+        
+    except Exception as e:
+        app.logger.error(f"API multi-percentage manipulation error: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/pixel-custom-byte-manipulate/<filename>", methods=["POST"])
+def api_pixel_custom_byte_manipulate(filename):
+    """API endpoint for direct custom pixel byte / byte range manipulation"""
+    if "logged_in" not in session:
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    
+    try:
+        file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+        if not os.path.exists(file_path):
+            return jsonify({"success": False, "error": "Source image not found"}), 404
+        
+        req_data = request.get_json() or {}
+        operation = req_data.get("operation", "set_value")
+        channels = req_data.get("channels", ["R", "G", "B"])
+        op_params = req_data.get("op_params", {})
+        roi = req_data.get("roi", None)
+        byte_range_filter = req_data.get("byte_range_filter", None)
+        
+        base_name, ext = os.path.splitext(filename)
+        output_filename = f"{base_name}_custom_{operation}.png"
+        output_path = os.path.join(app.config["UPLOAD_FOLDER"], output_filename)
+        
+        result = pixel_manipulator.manipulate_custom_bytes(
+            image_path=file_path,
+            output_path=output_path,
+            roi=roi,
+            channels=channels,
+            operation=operation,
+            op_params=op_params,
+            byte_range_filter=byte_range_filter
+        )
+        
+        if not result.get("success"):
+            return jsonify({"success": False, "error": result.get("error")}), 500
+        
+        return jsonify(result), 200
+        
+    except Exception as e:
+        app.logger.error(f"API custom byte manipulation error: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/pixel-manipulate-gray/<filename>", methods=["POST"])
+def api_pixel_manipulate_gray(filename):
+    """API endpoint to execute Grayscale pixel manipulation (bit planes, threshold, CLAHE, gamma, etc.)"""
+    if "logged_in" not in session:
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    
+    try:
+        file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+        if not os.path.exists(file_path):
+            return jsonify({"success": False, "error": "Source image not found"}), 404
+        
+        req_data = request.get_json() or {}
+        gray_method = req_data.get("gray_method", "luminance")
+        op_type = req_data.get("op_type", "bit_plane_slice")
+        op_params = req_data.get("op_params", {})
+        roi = req_data.get("roi", None)
+        
+        base_name, ext = os.path.splitext(filename)
+        output_filename = f"{base_name}_gray_{op_type}.png"
+        output_path = os.path.join(app.config["UPLOAD_FOLDER"], output_filename)
+        
+        result = pixel_manipulator.manipulate_grayscale(
+            image_path=file_path,
+            output_path=output_path,
+            gray_method=gray_method,
+            op_type=op_type,
+            op_params=op_params,
+            roi=roi
+        )
+        
+        if not result.get("success"):
+            return jsonify({"success": False, "error": result.get("error")}), 500
+        
+        return jsonify(result), 200
+        
+    except Exception as e:
+        app.logger.error(f"API Grayscale manipulation error: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/pixel-manipulate-gray-percentage/<filename>", methods=["POST"])
+def api_pixel_manipulate_gray_percentage(filename):
+    """
+    API endpoint for Grayscale pixel manipulation with preset (5%, 10%, 25%, 50%, 75%, 100%)
+    or arbitrary custom percentages (e.g. 37%, 48%, 99%) strictly within user-selected ROI area.
+    """
+    if "logged_in" not in session:
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+
+    try:
+        file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+        if not os.path.exists(file_path):
+            return jsonify({"success": False, "error": "Source image not found"}), 404
+
+        req_data = request.get_json() or {}
+        percentage = float(req_data.get("percentage", 10.0))
+        method = req_data.get("method", "gray_noise")
+        intensity = int(req_data.get("intensity", 50))
+        roi = req_data.get("roi", None)
+        gray_method = req_data.get("gray_method", "luminance")
+        op_params = req_data.get("op_params", {})
+
+        base_name, ext = os.path.splitext(filename)
+        pct_str = int(percentage) if percentage == int(percentage) else percentage
+        roi_suffix = ""
+        if roi:
+            roi_suffix = f"_roi_{roi.get('x1', roi.get('x', 0))}_{roi.get('y1', roi.get('y', 0))}"
+        output_filename = f"{base_name}_gray_manip_{pct_str}pct_{method}{roi_suffix}.png"
+        output_path = os.path.join(app.config["UPLOAD_FOLDER"], output_filename)
+
+        result = pixel_manipulator.manipulate_grayscale_percentage(
+            image_path=file_path,
+            output_path=output_path,
+            percentage=percentage,
+            method=method,
+            intensity=intensity,
+            roi=roi,
+            gray_method=gray_method,
+            op_params=op_params
+        )
+
+        if not result.get("success"):
+            return jsonify({"success": False, "error": result.get("error")}), 500
+
+        return jsonify(result), 200
+
+    except Exception as e:
+        app.logger.error(f"API Grayscale percentage manipulation error: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/pixel-manipulate-gray-multi/<filename>", methods=["POST"])
+def api_pixel_manipulate_gray_multi(filename):
+    """
+    API endpoint for simultaneous multi-percentage (5%, 10%, 25%, 50%, 75%, 100%) Grayscale matrix execution.
+    """
+    if "logged_in" not in session:
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+
+    try:
+        file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+        if not os.path.exists(file_path):
+            return jsonify({"success": False, "error": "Source image not found"}), 404
+
+        req_data = request.get_json() or {}
+        percentages = req_data.get("percentages", [5.0, 10.0, 25.0, 50.0, 75.0, 100.0])
+        method = req_data.get("method", "gray_noise")
+        intensity = int(req_data.get("intensity", 50))
+        roi = req_data.get("roi", None)
+        gray_method = req_data.get("gray_method", "luminance")
+        op_params = req_data.get("op_params", {})
+
+        result = pixel_manipulator.manipulate_grayscale_multi_percentages(
+            image_path=file_path,
+            output_dir=app.config["UPLOAD_FOLDER"],
+            percentages=percentages,
+            method=method,
+            intensity=intensity,
+            roi=roi,
+            gray_method=gray_method,
+            op_params=op_params
+        )
+
+        if not result.get("success"):
+            return jsonify({"success": False, "error": result.get("error")}), 500
+
+        return jsonify(result), 200
+
+    except Exception as e:
+        app.logger.error(f"API Grayscale multi-percentage manipulation error: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/convert-grayscale/<filename>", methods=["POST"])
+def api_convert_grayscale(filename):
+    """Convert an existing image to Grayscale, embed watermark, and register as new uploaded entry"""
+    if "logged_in" not in session:
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+
+    try:
+        file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+        if not os.path.exists(file_path):
+            return jsonify({"success": False, "error": "Source image not found"}), 404
+
+        req_data = request.get_json() if request.is_json else {}
+        gray_method = req_data.get("gray_method", "luminance") if req_data else "luminance"
+
+        img_bgr = cv2.imread(file_path)
+        if img_bgr is None:
+            return jsonify({"success": False, "error": "Unable to read image"}), 400
+
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        gray_arr = pixel_manipulator.convert_to_grayscale_array(img_rgb, method=gray_method)
+        gray_3ch = cv2.cvtColor(gray_arr, cv2.COLOR_GRAY2BGR)
+
+        base_name, _ = os.path.splitext(filename)
+        new_stored_name = f"{uuid4().hex}_gray_{gray_method}.png"
+        new_file_path = os.path.join(app.config["UPLOAD_FOLDER"], new_stored_name)
+
+        cv2.imwrite(new_file_path, gray_3ch)
+
+        # Embed watermark into grayscale image
+        try:
+            pixel_wm.embed_in_lsb(new_file_path, "Capstone")
+            app.logger.info(f"Watermark embedded into grayscale image: {new_stored_name}")
+        except Exception as e:
+            app.logger.warning(f"Grayscale watermark embed warning: {e}")
+
+        # Save to database
+        conn = get_db_connection()
+        conn.execute("INSERT INTO uploads (filename, original_name, pixels_converted) VALUES (?, ?, ?)",
+                     (new_stored_name, f"Grayscale_{gray_method.upper()}_{filename}", 0))
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            "success": True,
+            "message": f"Successfully converted to Grayscale ({gray_method}) with watermark embedded!",
+            "filename": new_stored_name
+        }), 200
+
+    except Exception as e:
+        app.logger.error(f"Grayscale conversion error: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/export-manipulation-excel/<filename>")
 def export_manipulation_excel(filename):
-    """Export pixel manipulation RGB statistical report as an Excel file"""
+    """Export pixel manipulation RGB or Grayscale statistical report as an Excel file"""
     if "logged_in" not in session:
         return redirect(url_for("login"))
     
@@ -546,31 +893,104 @@ def export_manipulation_excel(filename):
         if not os.path.exists(file_path):
             return jsonify({"success": False, "error": "Image not found"}), 404
         
-        # Get query parameters if any (default 10% noise)
-        percentage = float(request.args.get("percentage", 10))
-        method = request.args.get("method", "noise")
-        intensity = int(request.args.get("intensity", 50))
-        
+        is_gray = request.args.get("is_gray", "false").lower() == "true"
+        is_gray_pct = request.args.get("is_gray_percentage", "false").lower() == "true" or (is_gray and request.args.get("gray_percentage") is not None)
+        is_custom = request.args.get("is_custom", "false").lower() == "true"
         base_name, ext = os.path.splitext(filename)
-        manipulated_filename = f"{base_name}_manip_{int(percentage)}pct_{method}.png"
-        manipulated_path = os.path.join(app.config["UPLOAD_FOLDER"], manipulated_filename)
         
-        # If manipulated file doesn't exist yet, generate it
-        if not os.path.exists(manipulated_path):
-            stats_payload = pixel_manipulator.manipulate_image(
+        # Parse ROI parameters if provided
+        roi = None
+        if request.args.get("roi_x1") is not None and request.args.get("roi_x2") is not None:
+            roi = {
+                'x1': int(request.args.get("roi_x1", 0)),
+                'y1': int(request.args.get("roi_y1", 0)),
+                'x2': int(request.args.get("roi_x2", 0)),
+                'y2': int(request.args.get("roi_y2", 0))
+            }
+        
+        if is_gray_pct:
+            percentage = float(request.args.get("percentage") or request.args.get("gray_percentage", 10.0))
+            method = request.args.get("method", "gray_noise")
+            intensity = int(request.args.get("intensity", 50))
+            gray_method = request.args.get("gray_method", "luminance")
+            pct_str = int(percentage) if percentage == int(percentage) else percentage
+            roi_suffix = f"_roi_{roi['x1']}_{roi['y1']}" if roi else ""
+            manipulated_filename = f"{base_name}_gray_manip_{pct_str}pct_{method}{roi_suffix}.png"
+            manipulated_path = os.path.join(app.config["UPLOAD_FOLDER"], manipulated_filename)
+
+            stats_payload = pixel_manipulator.manipulate_grayscale_percentage(
                 image_path=file_path,
                 output_path=manipulated_path,
                 percentage=percentage,
                 method=method,
-                intensity=intensity
+                intensity=intensity,
+                roi=roi,
+                gray_method=gray_method
+            )
+        elif is_gray:
+            gray_method = request.args.get("gray_method", "luminance")
+            op_type = request.args.get("op_type", "bit_plane_slice")
+            manipulated_filename = f"{base_name}_gray_{op_type}.png"
+            manipulated_path = os.path.join(app.config["UPLOAD_FOLDER"], manipulated_filename)
+
+            op_params = {}
+            if request.args.get("bit_plane") is not None: op_params['bit_plane'] = int(request.args.get("bit_plane"))
+            if request.args.get("cutoff") is not None: op_params['cutoff'] = int(request.args.get("cutoff"))
+            if request.args.get("gamma") is not None: op_params['gamma'] = float(request.args.get("gamma"))
+
+            stats_payload = pixel_manipulator.manipulate_grayscale(
+                image_path=file_path,
+                output_path=manipulated_path,
+                gray_method=gray_method,
+                op_type=op_type,
+                op_params=op_params,
+                roi=roi
+            )
+        elif is_custom:
+            operation = request.args.get("operation", "set_value")
+            channels = request.args.getlist("channels") or ["R", "G", "B"]
+            val = request.args.get("value")
+            delta = request.args.get("delta")
+            mask = request.args.get("mask")
+            min_val = request.args.get("min_val")
+            max_val = request.args.get("max_val")
+            hex_color = request.args.get("hex_color")
+            
+            op_params = {}
+            if val is not None: op_params['value'] = int(val)
+            if delta is not None: op_params['delta'] = int(delta)
+            if mask is not None: op_params['mask'] = int(mask)
+            if min_val is not None: op_params['min_val'] = int(min_val)
+            if max_val is not None: op_params['max_val'] = int(max_val)
+            if hex_color is not None: op_params['hex_color'] = hex_color
+            
+            manipulated_filename = f"{base_name}_custom_{operation}.png"
+            manipulated_path = os.path.join(app.config["UPLOAD_FOLDER"], manipulated_filename)
+            
+            stats_payload = pixel_manipulator.manipulate_custom_bytes(
+                image_path=file_path,
+                output_path=manipulated_path,
+                roi=roi,
+                channels=channels,
+                operation=operation,
+                op_params=op_params
             )
         else:
+            percentage = float(request.args.get("percentage", 10))
+            method = request.args.get("method", "noise")
+            intensity = int(request.args.get("intensity", 50))
+            
+            pct_str = int(percentage) if percentage == int(percentage) else percentage
+            manipulated_filename = f"{base_name}_manip_{pct_str}pct_{method}.png"
+            manipulated_path = os.path.join(app.config["UPLOAD_FOLDER"], manipulated_filename)
+            
             stats_payload = pixel_manipulator.manipulate_image(
                 image_path=file_path,
                 output_path=manipulated_path,
                 percentage=percentage,
                 method=method,
-                intensity=intensity
+                intensity=intensity,
+                roi=roi
             )
         
         excel_filename = f"{base_name}_pixel_manipulation_stats.xlsx"
